@@ -1,0 +1,317 @@
+---
+title: "HW6 Key"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(leaflet)
+library(mnormt)
+library(LearnBayes)
+library(rjags)
+library(svMisc)
+
+set.seed(03112019)
+```
+
+## Introduction
+
+## Data
+
+```{r, fig.cap='Non-linear relationship between log price and sqft living space, consider including polynomial basis'}
+seattle <- read_csv('http://math.montana.edu/ahoegh/teaching/stat408/datasets/SeattleHousing.csv')
+
+seattle <- seattle %>% mutate(log.price = log(price), house.id = 1:n()) %>% select(log.price, lat, long, sqft_living, house.id)
+
+seattle %>% ggplot(aes(y=log.price, x=sqft_living)) + geom_point() + geom_smooth() + ggtitle('Log price vs. sqft living space')
+```
+
+
+
+```{r}
+# Create a subset for spatial modeling
+seattle.small <- seattle %>% sample_n(100)
+```
+
+
+```{r}
+seattle.small %>% leaflet() %>% addTiles() %>% addCircles(~long, ~lat)
+```
+
+
+## Methods
+
+First consider a regression framework with no spatial structure. For this framework, the following prior distributions are specified:
+\begin{eqnarray}
+  \boldsymbol{\beta} &\sim& N(\mu_0, \tau^2) \\
+  \sigma^2 &\sim& InverseGamma(a, b)
+\end{eqnarray}
+where $\mu_0 = 0$, $\sigma^2 = 1e8,$ and $a=b=.001$.
+```{r}
+seattle.small <- seattle.small %>% mutate(sqft_living2 = sqft_living^2)
+y <- seattle.small$log.price
+X <- model.matrix(log.price ~ sqft_living + sqft_living2, data = seattle.small)
+
+# initialize
+num.mcmc <- 1000
+p <- ncol(X)
+n <- nrow(X)
+beta.samples <- matrix(0, num.mcmc, p)
+sigmasq.samples <- rep(1, num.mcmc)
+XtX <- t(X) %*% X
+XtY <- t(X) %*% y
+
+# priors
+
+mu.0 <- rep(0, p)
+tau2 <- 1e8
+a <- .001
+b <- .001
+
+
+for (i in 2:num.mcmc){
+  
+  # sample beta
+  cov.beta <- solve(XtX / sigmasq.samples[i-1] + diag(p) / tau2)
+  exp.beta <- cov.beta %*% (XtY / sigmasq.samples[i-1] + mu.0 / tau2)
+  beta.samples[i, ] <- mnormt::rmnorm(1, exp.beta, cov.beta )
+  
+  # sample sigmasq
+  sigmasq.samples[i] <- rigamma(1, a + n/2, b + t(y - X %*% beta.samples[i,]) %*% (y - X %*% beta.samples[i,]) / 2)
+}
+
+summary(lm(log.price ~ sqft_living + sqft_living2, data = seattle.small))
+colMeans(beta.samples)
+mean(sqrt(sigmasq.samples))
+```
+This results in Bayesian estimates that closely match the results from `lm`.
+
+
+##### Spatial Regression
+
+Now spatial structure is added to the model using an exponential covariance function. Specifically, the model can be written as
+
+\begin{eqnarray}
+Y| W, \boldsymbol{\beta}, \sigma^2, \tau^2, \phi &\sim& N(X \boldsymbol{\beta} + W, \tau^2 I)\\
+W| \sigma^2,  \phi &\sim& N(0, \sigma^2 H(\phi)
+\end{eqnarray}
+
+Prior distributions are specified as
+\begin{eqnarray}
+  \boldsymbol{\beta} &\sim& N(\mu_0, \tau^2) \\
+  \sigma^2 &\sim& InverseGamma(a, b)\\
+  \tau^2 &\sim& InverseGamma(a, b)\\
+  \phi &\sim& Unif(L, U)
+\end{eqnarray}
+where $\mu_0 = 0$, $\sigma^2 = 1e8,$ $a=b=.001$, $L = 1 / .2$, and $U = 1 / .01$.
+```{r, eval = F, echo = F}
+#synthetic data
+beta.true <- coef(lm(log.price ~ sqft_living + sqft_living2, data = seattle.small)) %>% as.numeric() %>% as.matrix(nrow=3, ncol = 1)
+
+d <- dist(seattle.small %>% select(lat, long), diag = T, upper = T) %>% as.matrix()
+
+phi.true <- 1 / .1
+H.phi <- exp(-phi.true * d)
+sigmasq.true <- 10
+
+tausq.true <- 2
+
+w.true <- mnormt::rmnorm(1, rep(0,n), sigmasq.true * H.phi)
+
+y <- mnormt::rmnorm(1, X %*% beta.true + w.true, tausq.true * diag(n))
+
+```
+
+
+
+```{r}
+y <- seattle.small$log.price
+
+# initialize
+num.mcmc <- 10000
+p <- ncol(X)
+n <- nrow(X)
+beta.samples <- matrix(0, num.mcmc, p)
+sigmasq.samples <- rep(.1, num.mcmc)
+phi.samples <- rep(10, num.mcmc)
+tausq.samples <- rep(.1, num.mcmc)
+
+XtX <- t(X) %*% X
+
+d <- dist(seattle.small %>% select(lat, long), diag = T, upper = T) %>% as.matrix()
+
+H.phi <- exp(-d * phi.samples[1])
+
+# priors
+mu0.beta <- rep(0, p)
+tausq.beta <- 1e8
+a.tausq <- .001
+b.tausq <- .001
+a.sigmasq <- .001
+b.sigmasq <- .001
+w.samples <- rep(0, n)
+phi.upper <- 1 / .01
+phi.lower <- 1 / .2
+
+# MCMC parameters
+phi.step <- 5
+phi.accept <- rep(0, num.mcmc)
+
+for (i in 2:num.mcmc){
+  # sample beta - Gibbs draws from full conditional
+  cov.beta <- solve(XtX / tausq.samples[i-1] + diag(p) / tausq.beta)
+  exp.beta <- cov.beta %*% (t(X) %*% (y - w.samples) / tausq.samples[i-1] + mu0.beta / tausq.beta)
+  beta.samples[i, ] <- mnormt::rmnorm(1, exp.beta, cov.beta )
+  
+  # sample tausq - Gibbs draws from full conditional
+  tausq.samples[i] <- rigamma(1, a.tausq + n / 2, b.tausq + t(y - X %*% beta.samples[i,] - w.samples) %*% (y - X %*% beta.samples[i,] - w.samples) / 2)
+  
+  # sample W - Gibbs draws from full conditional
+  cov.w <- solve(diag(n) / tausq.samples[i] + solve(H.phi) / sigmasq.samples[i-1])
+  exp.w <- cov.w %*% (y - X %*% beta.samples[i,]) / tausq.samples[i]
+  w.samples <- mnormt::rmnorm(1, exp.w, cov.w)
+  
+  # sample sigmasq - Gibbs draws from full conditional
+  sigmasq.samples[i] <- rigamma(1, a.sigmasq + n / 2, b.sigmasq + t(w.samples) %*% solve(H.phi) %*% (w.samples) / 2)
+  
+  # sample phi - Metropolis - Hastings Proposal
+  phi.star <- -1
+  while (phi.star < phi.lower | phi.star > phi.upper){
+    phi.star <- phi.samples[i-1] + rnorm(1,mean = 0 , sd = phi.step)
+  }
+  
+  H.phi.star <- exp(-d * phi.star)
+  
+  log.pi <- LearnBayes::dmnorm(w.samples, mean = rep(0,n), varcov = sigmasq.samples[i] * H.phi, log = T)
+  log.pi.star <- LearnBayes::dmnorm(w.samples, mean = rep(0,n), varcov = sigmasq.samples[i] * H.phi.star, log = T)
+  
+  if ((log.pi.star - log.pi) > log(runif(1))){
+    phi.samples[i] <- phi.star
+    phi.accept[i] <- 1
+  } else{
+    phi.samples[i] <- phi.samples[i-1]
+  }
+  #progress(i, num.mcmc)
+}
+
+# hist(phi.samples)
+# plot(phi.samples, type = 'l')
+# hist(tausq.samples)
+# plot(tausq.samples, type = 'l')
+# hist(sigmasq.samples)
+# plot(sigmasq.samples, type = 'l')
+# hist(beta.samples[,1])
+# plot(beta.samples[,1], type = 'l')
+# hist(beta.samples[,2])
+# plot(beta.samples[,2], type = 'l')
+# hist(beta.samples[,3])
+# plot(beta.samples[,3], type = 'l')
+colMeans(beta.samples)
+mean(tausq.samples)
+mean(sigmasq.samples)
+mean(phi.samples)
+```
+
+#### JAGS comparison
+```{r, eval = F}
+# Specify data for JAGS         
+
+data.spatial <- list(x.reg1 = seattle.small$sqft_living, x.reg2 = seattle.small$sqft_living2, y = y, N = n, d = d)
+
+#Define Model
+model.spatial <- "model{
+# data | process
+  for(i in 1:N){
+    y[i]   ~ dnorm(mu[i], tausq.inv)
+    mu[i] <- beta[1] + beta[2] * x.reg1[i] + beta[3] * x.reg2[i] + W[i]
+    muW[i] <- 0
+  }
+
+# process | parameters
+  W[1:N] ~ dmnorm(muW[], Omega[,])
+  
+# parameters  
+  beta[1] ~ dnorm(0, 1E-8)
+  beta[2] ~ dnorm(0, 1E-8)
+  beta[3] ~ dnorm(0, 1E-8)
+  tausq.inv ~ dgamma(.001, .001)
+  tausq <- 1 / tausq.inv
+  sigmasq.inv ~ dgamma(.001, .001)
+  sigmasq <- 1 / sigmasq.inv
+  phi ~ dunif(2.5 , 100)
+  
+# build omega
+  for (i in 1:N){
+    for (j in 1:N){
+      H[i,j] <- (1/sigmasq.inv) * exp(-phi *d[i,j])
+    }
+  }
+  Omega[1:N,1:N] <- inverse(H[1:N,1:N])
+
+}"
+
+# compile model
+model <- jags.model(textConnection(model.spatial), data = data.spatial)
+
+# burn in
+update(model, 5000)
+
+# draw samples
+samp <- coda.samples(model, 
+        variable.names=c("beta","phi", "tausq",'sigmasq'), 
+        n.iter=10000)
+
+# plot samples
+summary(samp)
+plot(samp)
+```
+
+## Predictions
+
+```{r}
+# highlight predictions at subset of locations
+num.preds <- 10
+seattle.preds <- seattle %>% filter(!house.id %in% seattle.small$house.id) %>% sample_n(10)
+
+seattle.preds %>% leaflet() %>% addTiles() %>% addCircles(~long, ~lat)
+
+d.preds <- dist(seattle.preds %>% select(lat, long), diag = T, upper = T) %>% as.matrix()
+
+d.cross <- dist(seattle.preds %>% select(lat, long) %>% bind_rows(seattle.small %>% select(lat,long)), diag = T, upper = T) %>% as.matrix() 
+d.cross <- d.cross[1:num.preds,(num.preds+1):(num.preds+100)]
+
+#make predictions
+seattle.preds <- seattle.preds %>% mutate(sqft_living2 = sqft_living^2)
+X.preds <- model.matrix(log.price ~ sqft_living + sqft_living2, data = seattle.preds)
+y.preds <- matrix(0, num.mcmc, num.preds)
+
+for (i in 10:num.mcmc){
+  mu.pred <- X.preds %*% beta.samples[i,] 
+  mu.obs <- X %*% beta.samples[i,]
+  omega11 <- tausq.samples[i] * diag(num.preds) + sigmasq.samples[i] * exp(-d.preds * phi.samples[i])
+  omega22 <- tausq.samples[i] * diag(100) + sigmasq.samples[i] * exp(-d * phi.samples[i])
+  omega22.inv <- solve(omega22)
+  omega12 <- sigmasq.samples[i] * exp(-d.cross * phi.samples[i])
+  cond.exp <-  mu.pred + omega12 %*% omega22.inv %*% (y - mu.obs)
+  cond.cov <- omega11 - omega12 %*% omega22.inv %*% t(omega12)
+  y.preds[i, ] <- mnormt::rmnorm(1, cond.exp, cond.cov)
+  
+ # progress(i, num.mcmc)
+
+}
+
+par(mfcol = c(2,2))
+for (i in 1:num.preds){
+  hist(y.preds[10:num.mcmc,i], main = i, xlab = 'log price')
+  abline(v=seattle.preds$log.price[i], col='red', lwd = 2)
+}
+```
+
+
+
+## Results
+
